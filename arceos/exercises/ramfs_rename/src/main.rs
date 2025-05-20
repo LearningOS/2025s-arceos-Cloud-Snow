@@ -7,8 +7,8 @@ extern crate axstd as std;
 
 mod ramfs;
 
-use std::io::{self, prelude::*};
 use std::fs::{self, File};
+use std::io::{self, prelude::*};
 
 fn create_file(fname: &str, text: &str) -> io::Result<()> {
     println!("Create '{}' and write [{}] ...", fname, text);
@@ -42,6 +42,7 @@ fn process() -> io::Result<()> {
     // Just rename, NOT move.
     // So this must happen in the same directory.
     rename_file("/tmp/f1", "/tmp/f2")?;
+    println!("Rename file from '/tmp/f1' to '/tmp/f2' ... ");
     print_file("/tmp/f2")
 }
 

@@ -2,11 +2,11 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::{string::String, vec::Vec};
 
+use crate::file::FileNode;
 use axfs_vfs::{VfsDirEntry, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType};
 use axfs_vfs::{VfsError, VfsResult};
+use log::*;
 use spin::RwLock;
-
-use crate::file::FileNode;
 
 /// The directory node in the RAM filesystem.
 ///
@@ -125,12 +125,19 @@ impl VfsNodeOps for DirNode {
                 "" | "." => self.create(rest, ty),
                 ".." => self.parent().ok_or(VfsError::NotFound)?.create(rest, ty),
                 _ => {
-                    let subdir = self
-                        .children
-                        .read()
-                        .get(name)
-                        .ok_or(VfsError::NotFound)?
-                        .clone();
+                    let subdir = match self.children.read().get(name) {
+                        Some(node) => node.clone(),
+                        None => {
+                            //创建子目录
+                            self.create_node(name, VfsNodeType::Dir)?;
+                            self.children
+                                .read()
+                                .get(name)
+                                .ok_or(VfsError::NotFound)?
+                                .clone()
+                        }
+                    };
+
                     subdir.create(rest, ty)
                 }
             }
@@ -165,6 +172,56 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    //保证输入为绝对路径(不含挂载路径)，以/开头
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        debug!(
+            "rename at ramfs. src_path: {} dst_path: {}",
+            src_path, dst_path
+        );
+        // 将src_path的父目录和文件名/目录名分开
+        let (src_dir_name, src_name) = match src_path.rfind('/') {
+            Some(n) => (&src_path[..n], &src_path[n + 1..]),
+            None => ("", src_path),
+        };
+        let this = self.this.upgrade().ok_or(VfsError::NotFound)?;
+        let src_dir_node = this.clone().lookup(src_dir_name)?;
+        let src_node = src_dir_node.clone().lookup(src_name)?;
+
+        // 创建目标节点
+        this.clone()
+            .create(dst_path, src_node.get_attr()?.file_type())
+            .ok();
+        let (dst_dir_name, dst_name) = match dst_path.rfind('/') {
+            Some(n) => (&dst_path[..n], &dst_path[n + 1..]),
+            None => ("", dst_path),
+        };
+        let dst_dir_node = this.clone().lookup(dst_dir_name)?;
+
+        // 将原节点插入目标目录
+        dst_dir_node
+            .as_any()
+            .downcast_ref::<DirNode>()
+            .ok_or(VfsError::NotFound)?
+            .children
+            .write()
+            .insert(String::from(dst_name), src_node.clone());
+
+        // 当src_node为目录节点时，重置父节点
+        if let Some(dir_node) = src_node.as_any().downcast_ref::<DirNode>() {
+            dir_node.set_parent(Some(&dst_dir_node));
+        }
+
+        // 删除原节点
+        src_dir_node
+            .as_any()
+            .downcast_ref::<DirNode>()
+            .ok_or(VfsError::NotFound)?
+            .children
+            .write()
+            .remove(src_name);
+
+        Ok(())
+    }
     axfs_vfs::impl_vfs_dir_default! {}
 }
 

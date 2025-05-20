@@ -4,6 +4,7 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use axerrno::{ax_err, AxError, AxResult};
+use axfs_ramfs::DirNode;
 use axfs_vfs::{VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType, VfsOps, VfsResult};
 use axsync::Mutex;
 use lazyinit::LazyInit;
@@ -133,11 +134,23 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
+        debug!(
+            "RootDirectory rename, src_path: {}, dst_path: {}",
+            src_path, dst_path
+        );
+        self.lookup_mounted_fs(src_path, |src_fs, src_rest| {
+            if src_rest.is_empty() {
+                ax_err!(PermissionDenied, "cannot rename mount points") // cannot rename mount points
             } else {
-                fs.root_dir().rename(rest_path, dst_path)
+                self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                    if dst_path.is_empty() {
+                        ax_err!(PermissionDenied, "cannot rename mount points") // cannot rename mount points
+                    } else if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                        ax_err!(InvalidInput, "cannot rename across mount points")
+                    } else {
+                        src_fs.root_dir().rename(src_rest, dst_rest)
+                    }
+                })
             }
         })
     }
@@ -302,9 +315,12 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+    parent_node_of(None, old).lookup(old)?;
+
+    let old_abs = absolute_path(old)?;
+    let new_abs = absolute_path(new)?;
+    if old_abs == new_abs {
+        return ax_err!(InvalidInput, "src and dst are the same");
     }
-    parent_node_of(None, old).rename(old, new)
+    parent_node_of(None, old_abs.as_str()).rename(old_abs.as_str(), new_abs.as_str())
 }
