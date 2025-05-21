@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use arceos_posix_api as api;
+use arceos_posix_api::get_file_like;
 use axerrno::LinuxError;
 use axhal::arch::TrapFrame;
 use axhal::paging::MappingFlags;
@@ -8,6 +9,7 @@ use axhal::trap::{register_trap_handler, SYSCALL};
 use axtask::current;
 use axtask::TaskExtRef;
 use core::ffi::{c_char, c_int, c_void};
+use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -145,7 +147,72 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        let prot_flags: MmapProt = MmapProt::from_bits_truncate(prot);
+        let mmap_flags = MmapFlags::from_bits_truncate(flags);
+        ax_println!(
+            "sys_mmap: addr={:p}, length={:#x}, prot={:?}, flags={:?}, fd={:#x}, offset={:#x}",
+            addr,
+            length,
+            prot_flags,
+            mmap_flags,
+            fd,
+            _offset
+        );
+        let current = current();
+        let mut uspace = current.task_ext().aspace.lock();
+
+        // 处理 MAP_FIXED 标志
+        let vaddr = if !addr.is_null() && mmap_flags.contains(MmapFlags::MAP_FIXED) {
+            // 使用指定的地址
+            VirtAddr::from(addr as usize)
+        } else {
+            // 寻找空闲区域
+            uspace
+                .find_free_area(
+                    VirtAddr::from(addr as usize),
+                    length.align_up_4k(),
+                    VirtAddrRange::new(uspace.base(), uspace.end()),
+                )
+                .ok_or(LinuxError::ENOMEM)?
+        };
+
+        // 分配和映射内存
+        uspace
+            .map_alloc(vaddr, length.align_up_4k(), prot_flags.into(), true)
+            .map_err(|_| LinuxError::ENOMEM)?;
+
+        ax_println!("map_alloc success: vaddr={:#x}", vaddr);
+
+        // 处理匿名映射 (MAP_ANONYMOUS)
+        if mmap_flags.contains(MmapFlags::MAP_ANONYMOUS) {
+            // 匿名映射需要零填充内存
+            let zeros = alloc::vec![0u8; length];
+            uspace
+                .write(vaddr, &zeros)
+                .map_err(|_| LinuxError::EFAULT)?;
+
+            ax_println!("anonymous mapping success: vaddr={:#x}", vaddr);
+        } else if fd >= 0 {
+            // 文件映射
+            let file = get_file_like(fd).map_err(|_| LinuxError::EBADF)?;
+            ax_println!("file: {}", fd);
+
+            let mut buf = alloc::vec![0; length];
+            file.read(&mut buf).map_err(|_| LinuxError::EIO)?;
+            ax_println!("read success: buf.len={}", buf.len());
+
+            uspace.write(vaddr, &buf).map_err(|_| LinuxError::EFAULT)?;
+
+            ax_println!("write success: vaddr={:#x}", vaddr);
+        } else {
+            // 无效文件描述符且不是匿名映射
+            ax_println!("invalid fd and not anonymous mapping");
+            return Err(LinuxError::EBADF);
+        }
+
+        Ok(vaddr.as_usize() as isize)
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
